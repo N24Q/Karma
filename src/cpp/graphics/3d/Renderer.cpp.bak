@@ -1,0 +1,663 @@
+#define NOMINMAX
+#include <windows.h>
+
+// IMPORTANT: Include GLAD before GLFW to avoid OpenGL header conflicts
+#include <glad/glad.h>
+
+#include <GLFW/glfw3.h>
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+
+#include <filament/Engine.h>
+#include <filament/Renderer.h>
+#include <filament/Scene.h>
+#include <filament/View.h>
+#include <filament/Camera.h>
+#include <filament/TransformManager.h>
+#include <filament/SwapChain.h>
+#include <filament/LightManager.h>
+#include <filament/Color.h>
+#include <filament/Viewport.h>
+#include <filament/RenderableManager.h>
+#include <filament/MaterialInstance.h>
+#include <filament/Texture.h>
+#include <filament/IndirectLight.h>
+#include <filament/ColorGrading.h>
+#include <filament/RenderTarget.h>
+
+#include <backend/PixelBufferDescriptor.h>
+#include <utils/EntityManager.h>
+
+#include <gltfio/AssetLoader.h>
+#include <gltfio/FilamentAsset.h>
+#include <gltfio/ResourceLoader.h>
+#include <gltfio/MaterialProvider.h>
+#include <gltfio/TextureProvider.h>
+
+#include <image/Ktx1Bundle.h>
+#include <math/vec3.h>
+#include <math/mat4.h>
+
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <filesystem>
+#include <map>
+#include <string>
+#include <algorithm>
+
+using namespace filament;
+using namespace filament::math;
+using namespace gltfio;
+
+extern "C" {
+    extern void* windowPtr;
+}
+
+// Global Filament state
+static Engine* g_engine = nullptr;
+static Renderer* g_renderer = nullptr;
+static Scene* g_scene = nullptr;
+static View* g_view = nullptr;
+static Camera* g_camera = nullptr;
+static SwapChain* g_swapChain = nullptr;
+static AssetLoader* g_assetLoader = nullptr;
+static MaterialProvider* g_materialProvider = nullptr;
+static FilamentAsset* g_asset = nullptr;
+
+static int g_screenWidth = 1920;
+static int g_screenHeight = 1080;
+
+// Pixelation post-process state
+static float g_pixelScale = 1.0f;
+static bool g_pixelationEnabled = false;
+static GLuint g_pixelShaderProgram = 0;
+static GLuint g_fullscreenVAO = 0;
+static GLuint g_offscreenFBO = 0;
+static GLuint g_offscreenTexture = 0;
+static GLuint g_downsampledFBO = 0;
+static GLuint g_downsampledTexture = 0;
+
+// Camera and model transform state
+static float3 g_cameraPosition = float3(0.0f, 5.0f, 12.5f);
+static float3 g_cameraTarget = float3(0.0f, 0.0f, 0.0f);
+static float3 g_modelPosition = float3(0.0f, 0.0f, 0.0f);
+static float3 g_modelScale = float3(1.0f, 1.0f, 1.0f);
+static float g_modelYaw = 0.0f;
+static float g_modelPitch = 0.0f;
+
+// Camera movement state
+static bool g_keyW = false;
+static bool g_keyA = false;
+static bool g_keyS = false;
+static bool g_keyD = false;
+static float g_cameraSpeed = 0.1f;  // Units per frame
+
+static gltfio::TextureProvider* g_stbProvider = nullptr;
+static gltfio::TextureProvider* g_ktx2Provider = nullptr;
+
+// Keyboard callback for WASD camera controls
+static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    if (action == GLFW_PRESS) {
+        if (key == GLFW_KEY_W) g_keyW = true;
+        if (key == GLFW_KEY_A) g_keyA = true;
+        if (key == GLFW_KEY_S) g_keyS = true;
+        if (key == GLFW_KEY_D) g_keyD = true;
+    } else if (action == GLFW_RELEASE) {
+        if (key == GLFW_KEY_W) g_keyW = false;
+        if (key == GLFW_KEY_A) g_keyA = false;
+        if (key == GLFW_KEY_S) g_keyS = false;
+        if (key == GLFW_KEY_D) g_keyD = false;
+    }
+}
+
+static void UpdateCamera() {
+    if (!g_camera) return;
+    g_camera->lookAt(g_cameraPosition, g_cameraTarget, float3(0.0f, 1.0f, 0.0f));
+}
+
+static void UpdateModelTransform() {
+    if (!g_asset) return;
+    auto& tcm = g_engine->getTransformManager();
+    auto root = g_asset->getRoot();
+    if (!root.isNull()) {
+        auto ti = tcm.getInstance(root);
+        mat4f translation = mat4f::translation(g_modelPosition);
+        mat4f rotationY = mat4f::rotation(g_modelYaw, float3(0.0f, 1.0f, 0.0f));
+        mat4f rotationX = mat4f::rotation(g_modelPitch, float3(1.0f, 0.0f, 0.0f));
+        mat4f scale = mat4f::scaling(g_modelScale);
+        mat4f transform = translation * rotationY * rotationX * scale;
+        tcm.setTransform(ti, transform);
+    }
+}
+
+static std::vector<uint8_t> LoadFileToBuffer(const char* path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        std::cerr << "[Filament] Failed to open file: " << path << "\n";
+        return {};
+    }
+    size_t size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::vector<uint8_t> buffer(size);
+    file.read(reinterpret_cast<char*>(buffer.data()), size);
+    return buffer;
+}
+
+// Simple pixelation shader
+static const char* pixelVertexShader = R"(
+#version 330 core
+layout(location = 0) in vec2 aPos;
+out vec2 vTexCoord;
+void main() {
+    vTexCoord = aPos * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+)";
+
+// Simple passthrough fragment shader for upsampling with nearest-neighbor filtering
+static const char* pixelFragmentShader = R"(
+#version 330 core
+in vec2 vTexCoord;
+out vec4 FragColor;
+uniform sampler2D screenTexture;
+
+void main() {
+    FragColor = texture(screenTexture, vTexCoord);
+}
+)";
+
+static void InitPixelationShader() {
+    std::cout << "[Pixelation] Initializing shader...\n";
+
+    // Compile vertex shader
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &pixelVertexShader, nullptr);
+    glCompileShader(vs);
+
+    // Check vertex shader compilation
+    GLint success;
+    GLchar infoLog[512];
+    glGetShaderiv(vs, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(vs, 512, nullptr, infoLog);
+        std::cerr << "[Pixelation] ERROR: Vertex shader compilation failed:\n" << infoLog << "\n";
+        return;
+    }
+    std::cout << "[Pixelation] Vertex shader compiled successfully\n";
+
+    // Compile fragment shader
+    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, 1, &pixelFragmentShader, nullptr);
+    glCompileShader(fs);
+
+    // Check fragment shader compilation
+    glGetShaderiv(fs, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(fs, 512, nullptr, infoLog);
+        std::cerr << "[Pixelation] ERROR: Fragment shader compilation failed:\n" << infoLog << "\n";
+        glDeleteShader(vs);
+        return;
+    }
+    std::cout << "[Pixelation] Fragment shader compiled successfully\n";
+
+    // Link program
+    g_pixelShaderProgram = glCreateProgram();
+    glAttachShader(g_pixelShaderProgram, vs);
+    glAttachShader(g_pixelShaderProgram, fs);
+    glLinkProgram(g_pixelShaderProgram);
+
+    // Check program linking
+    glGetProgramiv(g_pixelShaderProgram, GL_LINK_STATUS, &success);
+    if (!success) {
+        glGetProgramInfoLog(g_pixelShaderProgram, 512, nullptr, infoLog);
+        std::cerr << "[Pixelation] ERROR: Program linking failed:\n" << infoLog << "\n";
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        return;
+    }
+    std::cout << "[Pixelation] Shader program linked successfully (ID: " << g_pixelShaderProgram << ")\n";
+
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    // Create fullscreen quad
+    float quadVertices[] = {
+        -1.0f,  1.0f,
+        -1.0f, -1.0f,
+         1.0f, -1.0f,
+        -1.0f,  1.0f,
+         1.0f, -1.0f,
+         1.0f,  1.0f
+    };
+
+    GLuint vbo;
+    glGenVertexArrays(1, &g_fullscreenVAO);
+    glGenBuffers(1, &vbo);
+    glBindVertexArray(g_fullscreenVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    glBindVertexArray(0);
+    std::cout << "[Pixelation] Fullscreen quad created (VAO ID: " << g_fullscreenVAO << ")\n";
+
+    // Create offscreen FBO and texture for rendering (full resolution)
+    glGenFramebuffers(1, &g_offscreenFBO);
+    glGenTextures(1, &g_offscreenTexture);
+    glBindTexture(GL_TEXTURE_2D, g_offscreenTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, g_screenWidth, g_screenHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, g_offscreenFBO);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_offscreenTexture, 0);
+
+    // Create depth buffer for offscreen FBO
+    GLuint depthRBO;
+    glGenRenderbuffers(1, &depthRBO);
+    glBindRenderbuffer(GL_RENDERBUFFER, depthRBO);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, g_screenWidth, g_screenHeight);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, depthRBO);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        std::cerr << "[Pixelation] ERROR: Offscreen framebuffer is not complete!\n";
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    std::cout << "[Pixelation] Offscreen FBO created (ID: " << g_offscreenFBO << ")\n";
+
+    // Create downsampled FBO and texture (for pixelation effect)
+    // Initial size will be set when pixelation is enabled
+    glGenFramebuffers(1, &g_downsampledFBO);
+    glGenTextures(1, &g_downsampledTexture);
+    std::cout << "[Pixelation] Downsampled FBO created (ID: " << g_downsampledFBO << ")\n";
+
+    std::cout << "[Pixelation] Post-process shader initialized successfully!\n";
+}
+
+extern "C" {
+
+int InitRenderer() {
+    std::cout << "[Filament] InitRenderer called\n";
+
+    GLFWwindow* window = static_cast<GLFWwindow*>(windowPtr);
+    if (!window) {
+        std::cerr << "[Filament] No window!\n";
+        return -1;
+    }
+
+    glfwShowWindow(window);
+    glfwPollEvents();
+    Sleep(100);
+
+    // Load OpenGL functions via GLAD (required for our shader code!)
+    glfwMakeContextCurrent(window);
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+        std::cerr << "[Filament] Failed to initialize GLAD\n";
+        return -1;
+    }
+    std::cout << "[Filament] GLAD initialized, OpenGL version: "
+              << glGetString(GL_VERSION) << "\n";
+
+    glfwGetFramebufferSize(window, &g_screenWidth, &g_screenHeight);
+    std::cout << "[Filament] Screen size: " << g_screenWidth << "x" << g_screenHeight << "\n";
+
+    g_engine = Engine::create(Engine::Backend::OPENGL);
+    if (!g_engine) {
+        std::cerr << "[Filament] Failed to create engine\n";
+        return -1;
+    }
+
+    HWND nativeWindow = glfwGetWin32Window(window);
+    g_swapChain = g_engine->createSwapChain(nativeWindow);
+    g_renderer = g_engine->createRenderer();
+    g_scene = g_engine->createScene();
+    g_view = g_engine->createView();
+    g_view->setScene(g_scene);
+
+    g_camera = g_engine->createCamera(utils::EntityManager::get().create());
+    float aspect = (float)g_screenWidth / (float)g_screenHeight;
+    g_camera->setProjection(45.0, aspect, 0.01, 1000.0, Camera::Fov::VERTICAL);
+    g_camera->setExposure(5.6f, 1.0f / 50.0f, 400.0f);
+
+    UpdateCamera();
+    g_view->setCamera(g_camera);
+    g_view->setViewport(Viewport(0, 0, g_screenWidth, g_screenHeight));
+    g_view->setPostProcessingEnabled(true);
+
+    View::RenderQuality renderQuality{};
+    renderQuality.hdrColorBuffer = View::QualityLevel::HIGH;
+    g_view->setRenderQuality(renderQuality);
+    g_view->setAntiAliasing(View::AntiAliasing::FXAA);
+
+    View::AmbientOcclusionOptions aoOptions{};
+    aoOptions.enabled = true;
+    aoOptions.intensity = 1.0f;
+    aoOptions.quality = View::QualityLevel::HIGH;
+    g_view->setAmbientOcclusionOptions(aoOptions);
+
+    auto colorGrading = ColorGrading::Builder()
+        .toneMapping(ColorGrading::ToneMapping::ACES)
+        .build(*g_engine);
+    g_view->setColorGrading(colorGrading);
+
+    g_view->setShadowingEnabled(true);
+    g_view->setShadowType(View::ShadowType::PCF);
+    g_view->setDithering(View::Dithering::TEMPORAL);
+
+    g_materialProvider = createJitShaderProvider(g_engine);
+    if (!g_materialProvider) {
+        std::cerr << "[Filament] Failed to create material provider\n";
+        return -1;
+    }
+
+    g_stbProvider = gltfio::createStbProvider(g_engine);
+    g_ktx2Provider = gltfio::createKtx2Provider(g_engine);
+
+    AssetConfiguration loaderConfig{};
+    loaderConfig.engine = g_engine;
+    loaderConfig.materials = g_materialProvider;
+    g_assetLoader = AssetLoader::create(loaderConfig);
+    if (!g_assetLoader) {
+        std::cerr << "[Filament] Failed to create asset loader\n";
+        return -1;
+    }
+
+    // Initialize pixelation shader
+    InitPixelationShader();
+
+    // Register keyboard callback for WASD camera controls
+    glfwSetKeyCallback(window, KeyCallback);
+    std::cout << "[Filament] WASD camera controls enabled\n";
+
+    std::cout << "[Filament] Renderer initialized successfully\n";
+    return 0;
+}
+
+bool LoadGLTF(const char* path) {
+    std::cout << "[Filament] Loading GLTF: " << path << "\n";
+
+    if (!g_assetLoader) {
+        std::cerr << "[Filament] AssetLoader not initialized\n";
+        return false;
+    }
+
+    if (g_asset) {
+        g_scene->removeEntities(g_asset->getEntities(), g_asset->getEntityCount());
+        g_assetLoader->destroyAsset(g_asset);
+        g_asset = nullptr;
+    }
+
+    std::vector<uint8_t> buffer = LoadFileToBuffer(path);
+    if (buffer.empty()) return false;
+
+    g_asset = g_assetLoader->createAsset(buffer.data(), buffer.size());
+    if (!g_asset) {
+        std::cerr << "[Filament] Failed to create asset\n";
+        return false;
+    }
+
+    ResourceConfiguration resConfig{};
+    resConfig.engine = g_engine;
+    resConfig.gltfPath = path;
+    resConfig.normalizeSkinningWeights = true;
+
+    ResourceLoader resourceLoader(resConfig);
+    resourceLoader.addTextureProvider("image/png", g_stbProvider);
+    resourceLoader.addTextureProvider("image/jpeg", g_stbProvider);
+    resourceLoader.addTextureProvider("image/ktx2", g_ktx2Provider);
+
+    if (!resourceLoader.loadResources(g_asset)) {
+        std::cerr << "[Filament] Failed to load resources\n";
+        return false;
+    }
+
+    g_scene->addEntities(g_asset->getEntities(), g_asset->getEntityCount());
+
+    // Commented out: High intensity multipliers were causing lighting to flash
+    // auto& lm = g_engine->getLightManager();
+    // for (size_t i = 0; i < g_asset->getLightEntityCount(); i++) {
+    //     auto entity = g_asset->getLightEntities()[i];
+    //     auto inst = lm.getInstance(entity);
+    //     if (!inst.isValid()) continue;
+
+    //     LightManager::Type type = lm.getType(inst);
+    //     float intensity = lm.getIntensity(inst);
+
+    //     switch (type) {
+    //         case LightManager::Type::SUN:
+    //         case LightManager::Type::DIRECTIONAL:
+    //             lm.setIntensity(inst, intensity * 50000.0f);
+    //             break;
+    //         case LightManager::Type::POINT:
+    //             lm.setIntensity(inst, intensity * 15.0f);
+    //             break;
+    //         case LightManager::Type::SPOT:
+    //         case LightManager::Type::FOCUSED_SPOT:
+    //             lm.setIntensity(inst, intensity * 10.0f);
+    //             break;
+    //     }
+    // }
+
+    // Commented out: High indirect light intensity was causing lighting to flash
+    // IndirectLight* ibl = IndirectLight::Builder()
+    //     .intensity(30000.0f)
+    //     .build(*g_engine);
+    // g_scene->setIndirectLight(ibl);
+
+    auto aabb = g_asset->getBoundingBox();
+    float3 center = (aabb.min + aabb.max) * 0.5f;
+    float3 extent = aabb.max - aabb.min;
+    float maxExtent = std::max({extent.x, extent.y, extent.z});
+
+    g_cameraTarget = center;
+    g_cameraPosition = center + float3(0.0f, maxExtent * 0.5f, maxExtent * 2.0f);
+    UpdateCamera();
+    UpdateModelTransform();
+
+    std::cout << "[Filament] GLTF loaded successfully\n";
+    return true;
+}
+
+void SetModelTransform(float posX, float posY, float posZ,
+                       float scaleX, float scaleY, float scaleZ,
+                       float yaw, float pitch)
+{
+    g_modelPosition = float3(posX, posY, posZ);
+    g_modelScale = float3(scaleX, scaleY, scaleZ);
+    g_modelYaw = yaw;
+    g_modelPitch = pitch;
+    UpdateModelTransform();
+}
+
+void SetCameraTransform(float camPosX, float camPosY, float camPosZ,
+                        float focusX, float focusY, float focusZ)
+{
+    g_cameraPosition = float3(camPosX, camPosY, camPosZ);
+    g_cameraTarget = float3(focusX, focusY, focusZ);
+    UpdateCamera();
+}
+
+void SetPixelationAmount(float scale) {
+    scale = std::clamp(scale, 0.01f, 1.0f);  // Allow 1% to 100%
+    g_pixelScale = scale;
+    g_pixelationEnabled = true;
+
+    // Calculate downsampled resolution
+    int downsampledWidth = (int)(g_screenWidth * scale);
+    int downsampledHeight = (int)(g_screenHeight * scale);
+
+    // Recreate downsampled texture with new size
+    glBindTexture(GL_TEXTURE_2D, g_downsampledTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, downsampledWidth, downsampledHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);  // Nearest for pixelated look
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);  // Nearest for pixelated look
+
+    // Attach to FBO
+    glBindFramebuffer(GL_FRAMEBUFFER, g_downsampledFBO);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_downsampledTexture, 0);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        std::cerr << "[Pixelation] ERROR: Downsampled framebuffer is not complete!\n";
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    std::cout << "[Pixelation] Effect enabled with scale: " << (scale * 100.0f)
+              << "% (" << downsampledWidth << "x" << downsampledHeight << ")\n";
+}
+
+void DisablePixelation() {
+    g_pixelationEnabled = false;
+    g_pixelScale = 1.0f;
+    std::cout << "[Pixelation] Effect disabled\n";
+}
+
+void RenderFrame() {
+    if (!g_renderer || !g_swapChain || !g_view) return;
+
+    static int frameCount = 0;
+    static bool debugPrinted = false;
+
+    // Handle WASD camera movement on XZ plane
+    float3 movement(0.0f, 0.0f, 0.0f);
+    if (g_keyW) movement.z -= g_cameraSpeed;  // Forward (negative Z)
+    if (g_keyS) movement.z += g_cameraSpeed;  // Backward (positive Z)
+    if (g_keyA) movement.x -= g_cameraSpeed;  // Left (negative X)
+    if (g_keyD) movement.x += g_cameraSpeed;  // Right (positive X)
+
+    if (length(movement) > 0.0f) {
+        g_cameraPosition += movement;
+        g_cameraTarget += movement;  // Move target with camera to maintain view direction
+        UpdateCamera();
+    }
+
+    if (g_pixelationEnabled && g_pixelShaderProgram && g_offscreenFBO && g_downsampledFBO) {
+        // FAST PIXELATION: Render to offscreen FBO, blit to downsampled, then upsample to screen
+
+        if (!debugPrinted) {
+            std::cout << "[Pixelation] GPU-accelerated pixelation ACTIVE! Scale: " << g_pixelScale << "\n";
+            debugPrinted = true;
+        }
+
+        // Step 1: Render Filament scene to offscreen FBO at full resolution
+        glBindFramebuffer(GL_FRAMEBUFFER, g_offscreenFBO);
+        glViewport(0, 0, g_screenWidth, g_screenHeight);
+
+        if (g_renderer->beginFrame(g_swapChain)) {
+            g_renderer->render(g_view);
+            g_renderer->endFrame();
+        }
+
+        // Step 2: Downsample to smaller texture (this creates the pixelation)
+        int downsampledWidth = (int)(g_screenWidth * g_pixelScale);
+        int downsampledHeight = (int)(g_screenHeight * g_pixelScale);
+
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_offscreenFBO);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_downsampledFBO);
+        glBlitFramebuffer(
+            0, 0, g_screenWidth, g_screenHeight,
+            0, 0, downsampledWidth, downsampledHeight,
+            GL_COLOR_BUFFER_BIT, GL_LINEAR
+        );
+
+        // Step 3: Upsample back to screen with nearest-neighbor (preserves pixelation)
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, g_screenWidth, g_screenHeight);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        glDisable(GL_BLEND);
+        glDisable(GL_DEPTH_TEST);
+
+        glUseProgram(g_pixelShaderProgram);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_downsampledTexture);
+        glUniform1i(glGetUniformLocation(g_pixelShaderProgram, "screenTexture"), 0);
+
+        glBindVertexArray(g_fullscreenVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+        glEnable(GL_DEPTH_TEST);
+
+        // Present
+        GLFWwindow* window = static_cast<GLFWwindow*>(windowPtr);
+        if (window) {
+            glfwSwapBuffers(window);
+        }
+    } else {
+        // WITHOUT PIXELATION: Normal Filament rendering
+        if (g_renderer->beginFrame(g_swapChain)) {
+            g_renderer->render(g_view);
+            g_renderer->endFrame();
+        }
+
+        if (debugPrinted) {
+            std::cout << "[Pixelation] Post-process is now DISABLED\n";
+            debugPrinted = false;
+        }
+    }
+
+    frameCount++;
+}
+
+void CleanupRenderer() {
+    std::cout << "[Filament] Cleaning up...\n";
+
+    // Cleanup pixelation resources
+    if (g_pixelShaderProgram) {
+        glDeleteProgram(g_pixelShaderProgram);
+        g_pixelShaderProgram = 0;
+    }
+    if (g_fullscreenVAO) {
+        glDeleteVertexArrays(1, &g_fullscreenVAO);
+        g_fullscreenVAO = 0;
+    }
+    if (g_offscreenTexture) {
+        glDeleteTextures(1, &g_offscreenTexture);
+        g_offscreenTexture = 0;
+    }
+    if (g_offscreenFBO) {
+        glDeleteFramebuffers(1, &g_offscreenFBO);
+        g_offscreenFBO = 0;
+    }
+    if (g_downsampledTexture) {
+        glDeleteTextures(1, &g_downsampledTexture);
+        g_downsampledTexture = 0;
+    }
+    if (g_downsampledFBO) {
+        glDeleteFramebuffers(1, &g_downsampledFBO);
+        g_downsampledFBO = 0;
+    }
+
+    if (g_asset) {
+        g_scene->removeEntities(g_asset->getEntities(), g_asset->getEntityCount());
+        g_assetLoader->destroyAsset(g_asset);
+        g_asset = nullptr;
+    }
+
+    if (g_assetLoader) AssetLoader::destroy(&g_assetLoader);
+    if (g_stbProvider) delete g_stbProvider;
+    if (g_ktx2Provider) delete g_ktx2Provider;
+    if (g_materialProvider) {
+        g_materialProvider->destroyMaterials();
+        delete g_materialProvider;
+    }
+
+    if (g_camera) {
+        utils::Entity camEntity = g_camera->getEntity();
+        g_engine->destroyCameraComponent(camEntity);
+        utils::EntityManager::get().destroy(camEntity);
+    }
+
+    if (g_view) g_engine->destroy(g_view);
+    if (g_scene) g_engine->destroy(g_scene);
+    if (g_renderer) g_engine->destroy(g_renderer);
+    if (g_swapChain) g_engine->destroy(g_swapChain);
+    if (g_engine) Engine::destroy(&g_engine);
+
+    std::cout << "[Filament] Cleanup complete\n";
+}
+
+} // extern "C"

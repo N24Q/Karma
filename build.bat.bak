@@ -1,0 +1,165 @@
+@echo off
+setlocal enabledelayedexpansion
+REM ========================================
+REM MSVC Build Script for Karma Project
+REM ========================================
+
+REM --- Setup MSVC Environment ---
+echo Setting up MSVC environment...
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: Failed to setup MSVC environment
+    echo Make sure Visual Studio 2022 is installed
+    exit /b 1
+)
+
+REM --- Configuration ---
+set BUILD_DIR=build
+set SRC_DIR=src
+set INCLUDE_DIR=include
+set LIB_DIR=libs
+
+REM Create build directory
+if not exist %BUILD_DIR% mkdir %BUILD_DIR%
+
+echo.
+echo ========================================
+echo Building Karma Project with MSVC
+echo ========================================
+echo.
+
+REM --- Compile Assembly ---
+echo [1/10] Compiling main.asm...
+"C:\Program Files\NASM\nasm.exe" -f win64 %SRC_DIR%\asm\main.asm -o %BUILD_DIR%\main.obj
+if errorlevel 1 goto :error
+
+REM --- Compile C/C++ Files ---
+echo [2/10] Compiling glad.c...
+cl /c /nologo /MT /std:c11 ^
+   /I"%INCLUDE_DIR%" ^
+   %SRC_DIR%\cpp\glad.c ^
+   /Fo%BUILD_DIR%\glad.obj
+if errorlevel 1 goto :error
+
+echo [3/10] Compiling Window.cpp...
+cl /c /nologo /EHsc /MT /std:c++20 ^
+   /I"%INCLUDE_DIR%" ^
+   %SRC_DIR%\cpp\system\Window.cpp ^
+   /Fo%BUILD_DIR%\Window.obj
+if errorlevel 1 goto :error
+
+echo [4/10] Compiling startup.cpp...
+cl /c /nologo /EHsc /MT /std:c++20 ^
+   /I"%INCLUDE_DIR%" ^
+   %SRC_DIR%\cpp\startup.cpp ^
+   /Fo%BUILD_DIR%\startup.obj
+if errorlevel 1 goto :error
+
+echo [5/10] Compiling VideoPlayer.cpp...
+cl /c /nologo /EHsc /MT /std:c++20 ^
+   /I"%INCLUDE_DIR%" ^
+   %SRC_DIR%\cpp\multimedia\VideoPlayer.cpp ^
+   /Fo%BUILD_DIR%\VideoPlayer.obj
+if errorlevel 1 goto :error
+
+echo [6/10] Compiling PlayVideo.cpp...
+cl /c /nologo /EHsc /MT /std:c++20 ^
+   /I"%INCLUDE_DIR%" ^
+   %SRC_DIR%\cpp\multimedia\PlayVideo.cpp ^
+   /Fo%BUILD_DIR%\PlayVideo.obj
+if errorlevel 1 goto :error
+
+echo [7/10] Compiling AudioPlayer.cpp...
+cl /c /nologo /EHsc /MT /std:c++20 ^
+   /I"%INCLUDE_DIR%" ^
+   %SRC_DIR%\cpp\multimedia\AudioPlayer.cpp ^
+   /Fo%BUILD_DIR%\AudioPlayer.obj
+if errorlevel 1 goto :error
+
+echo [8/10] Compiling PlayAudio.cpp...
+cl /c /nologo /EHsc /MT /std:c++20 ^
+   /I"%INCLUDE_DIR%" ^
+   %SRC_DIR%\cpp\multimedia\PlayAudio.cpp ^
+   /Fo%BUILD_DIR%\PlayAudio.obj
+if errorlevel 1 goto :error
+
+echo [9/10] Compiling Renderer.cpp...
+cl /c /nologo /EHsc /MT /std:c++20 ^
+   /I"%INCLUDE_DIR%" ^
+   %SRC_DIR%\cpp\graphics\3d\Renderer.cpp ^
+   /Fo%BUILD_DIR%\Renderer.obj
+if errorlevel 1 goto :error
+
+echo [10/10] Compiling tiny_gltf.cpp...
+cl /c /nologo /EHsc /MT /std:c++20 ^
+   /I"%INCLUDE_DIR%" ^
+   %SRC_DIR%\cpp\tiny_gltf.cpp ^
+   /Fo%BUILD_DIR%\tiny_gltf.obj
+if errorlevel 1 goto :error
+
+REM --- Link ---
+echo.
+echo Linking program.exe...
+link /NOLOGO ^
+     %BUILD_DIR%\main.obj ^
+     %BUILD_DIR%\glad.obj ^
+     %BUILD_DIR%\Window.obj ^
+     %BUILD_DIR%\startup.obj ^
+     %BUILD_DIR%\VideoPlayer.obj ^
+     %BUILD_DIR%\PlayVideo.obj ^
+     %BUILD_DIR%\AudioPlayer.obj ^
+     %BUILD_DIR%\PlayAudio.obj ^
+     %BUILD_DIR%\Renderer.obj ^
+     %BUILD_DIR%\tiny_gltf.obj ^
+     /LIBPATH:"%LIB_DIR%" ^
+     glfw3dll.lib ^
+     libvlc.lib ^
+     libvlccore.lib ^
+     opengl32.lib ^
+     gdi32.lib ^
+     glu32.lib ^
+     user32.lib ^
+     shell32.lib ^
+     shlwapi.lib ^
+     /OUT:%BUILD_DIR%\program.exe
+if errorlevel 1 goto :error
+
+REM --- Copy DLLs ---
+echo.
+echo Copying runtime DLLs...
+if exist "%LIB_DIR%\glfw3.dll" (
+    copy /Y "%LIB_DIR%\glfw3.dll" "%BUILD_DIR%\" >nul
+    echo   - glfw3.dll
+)
+if exist "%LIB_DIR%\libvlc.dll" (
+    copy /Y "%LIB_DIR%\libvlc.dll" "%BUILD_DIR%\" >nul
+    echo   - libvlc.dll
+)
+if exist "%LIB_DIR%\libvlccore.dll" (
+    copy /Y "%LIB_DIR%\libvlccore.dll" "%BUILD_DIR%\" >nul
+    echo   - libvlccore.dll
+)
+
+REM Copy VLC plugins folder if it exists
+if exist "%LIB_DIR%\plugins" (
+    if not exist "%BUILD_DIR%\plugins" mkdir "%BUILD_DIR%\plugins"
+    xcopy /E /I /Y /Q "%LIB_DIR%\plugins" "%BUILD_DIR%\plugins" >nul
+    echo   - plugins folder
+)
+
+echo.
+echo ========================================
+echo Build completed successfully!
+echo Executable: %BUILD_DIR%\program.exe
+echo ========================================
+goto :end
+
+:error
+echo.
+echo ========================================
+echo BUILD FAILED!
+echo ========================================
+exit /b 1
+
+:end
+endlocal

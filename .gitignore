@@ -1,0 +1,48 @@
+/.claude
+/README.md
+
+# Build output
+build/
+!build.bat
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# Large binary files
+libs/
+*.lib
+*.dll
+*.a
+*.so
+
+# Large assets (models, textures)
+assets/
+*.glb
+*.gltf
+*.fbx
+*.obj
+*.bin
+*.mp3
+*.wav
+*.ogg
+
+# Reserved Windows device names
+nul
+NUL
+con
+CON
+prn
+PRN
+aux
+AUX
+
+# IDE files
+.vscode/
+.vs/
+*.user
+*.suo
+*.sln
+*.vcxproj
+*.vcxproj.filters

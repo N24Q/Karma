@@ -1,0 +1,780 @@
+#define NOMINMAX
+#include <windows.h>
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+
+#define TINYGLTF_IMPLEMENTATION
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <tinygltf/tiny_gltf.h>
+
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <glm/gtc/quaternion.hpp>
+
+#include <iostream>
+#include <vector>
+#include <string>
+#include <map>
+
+extern "C" {
+    extern void* windowPtr;
+}
+
+// Screen dimensions
+static int g_screenWidth = 1920;
+static int g_screenHeight = 1080;
+
+// Camera state
+static glm::vec3 g_cameraPosition(0.0f, 5.0f, 12.5f);
+static glm::vec3 g_cameraTarget(0.0f, 0.0f, 0.0f);
+static glm::vec3 g_cameraUp(0.0f, 1.0f, 0.0f);
+
+// Model transform state
+static glm::vec3 g_modelPosition(0.0f, 0.0f, 0.0f);
+static glm::vec3 g_modelScale(1.0f, 1.0f, 1.0f);
+static float g_modelYaw = 0.0f;
+static float g_modelPitch = 0.0f;
+
+// Camera movement state
+static bool g_keyW = false;
+static bool g_keyA = false;
+static bool g_keyS = false;
+static bool g_keyD = false;
+static float g_cameraSpeed = 0.1f;
+
+// Pixelation state
+static float g_pixelScale = 1.0f;
+static bool g_pixelationEnabled = false;
+static GLuint g_offscreenFBO = 0;
+static GLuint g_offscreenTexture = 0;
+static GLuint g_offscreenDepthRBO = 0;
+static GLuint g_downsampledFBO = 0;
+static GLuint g_downsampledTexture = 0;
+static GLuint g_pixelShaderProgram = 0;
+static GLuint g_fullscreenVAO = 0;
+
+// Main rendering shader
+static GLuint g_mainShaderProgram = 0;
+
+// GLTF model data
+struct Mesh {
+    GLuint vao;
+    GLuint vbo;
+    GLuint ebo;
+    int indexCount;
+    GLuint baseColorTexture;
+    glm::vec4 baseColorFactor;
+    glm::mat4 nodeTransform;  // Transformation from GLTF scene graph
+};
+
+static std::vector<Mesh> g_meshes;
+static tinygltf::Model g_model;
+
+// Vertex shader for main scene rendering
+static const char* mainVertexShader = R"(
+#version 330 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec2 aTexCoord;
+
+out vec3 FragPos;
+out vec3 Normal;
+out vec2 TexCoord;
+
+uniform mat4 model;
+uniform mat4 view;
+uniform mat4 projection;
+
+void main() {
+    FragPos = vec3(model * vec4(aPos, 1.0));
+    Normal = mat3(transpose(inverse(model))) * aNormal;
+    TexCoord = aTexCoord;
+    gl_Position = projection * view * vec4(FragPos, 1.0);
+}
+)";
+
+// Fragment shader with basic Phong lighting
+static const char* mainFragmentShader = R"(
+#version 330 core
+out vec4 FragColor;
+
+in vec3 FragPos;
+in vec3 Normal;
+in vec2 TexCoord;
+
+uniform sampler2D baseColorTexture;
+uniform vec4 baseColorFactor;
+uniform vec3 lightPos;
+uniform vec3 viewPos;
+uniform bool hasTexture;
+
+void main() {
+    // Base color
+    vec4 baseColor = baseColorFactor;
+    if (hasTexture) {
+        baseColor *= texture(baseColorTexture, TexCoord);
+    }
+
+    // Ambient lighting
+    float ambientStrength = 0.3;
+    vec3 ambient = ambientStrength * vec3(1.0);
+
+    // Diffuse lighting
+    vec3 norm = normalize(Normal);
+    vec3 lightDir = normalize(lightPos - FragPos);
+    float diff = max(dot(norm, lightDir), 0.0);
+    vec3 diffuse = diff * vec3(1.0);
+
+    // Specular lighting
+    float specularStrength = 0.5;
+    vec3 viewDir = normalize(viewPos - FragPos);
+    vec3 reflectDir = reflect(-lightDir, norm);
+    float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32.0);
+    vec3 specular = specularStrength * spec * vec3(1.0);
+
+    vec3 result = (ambient + diffuse + specular) * baseColor.rgb;
+    FragColor = vec4(result, baseColor.a);
+}
+)";
+
+// Pixelation passthrough shaders
+static const char* pixelVertexShader = R"(
+#version 330 core
+layout(location = 0) in vec2 aPos;
+out vec2 vTexCoord;
+void main() {
+    vTexCoord = aPos * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+)";
+
+static const char* pixelFragmentShader = R"(
+#version 330 core
+in vec2 vTexCoord;
+out vec4 FragColor;
+uniform sampler2D screenTexture;
+void main() {
+    FragColor = texture(screenTexture, vTexCoord);
+}
+)";
+
+// Keyboard callback
+static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    if (action == GLFW_PRESS) {
+        if (key == GLFW_KEY_W) g_keyW = true;
+        if (key == GLFW_KEY_A) g_keyA = true;
+        if (key == GLFW_KEY_S) g_keyS = true;
+        if (key == GLFW_KEY_D) g_keyD = true;
+    } else if (action == GLFW_RELEASE) {
+        if (key == GLFW_KEY_W) g_keyW = false;
+        if (key == GLFW_KEY_A) g_keyA = false;
+        if (key == GLFW_KEY_S) g_keyS = false;
+        if (key == GLFW_KEY_D) g_keyD = false;
+    }
+}
+
+// Shader compilation helper
+static GLuint CompileShader(const char* source, GLenum type) {
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+
+    GLint success;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        char infoLog[512];
+        glGetShaderInfoLog(shader, 512, nullptr, infoLog);
+        std::cerr << "[Shader] Compilation failed:\n" << infoLog << "\n";
+        return 0;
+    }
+    return shader;
+}
+
+// Shader program linking helper
+static GLuint CreateShaderProgram(const char* vertexSrc, const char* fragmentSrc) {
+    GLuint vs = CompileShader(vertexSrc, GL_VERTEX_SHADER);
+    GLuint fs = CompileShader(fragmentSrc, GL_FRAGMENT_SHADER);
+
+    if (!vs || !fs) return 0;
+
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glLinkProgram(program);
+
+    GLint success;
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success) {
+        char infoLog[512];
+        glGetProgramInfoLog(program, 512, nullptr, infoLog);
+        std::cerr << "[Shader] Linking failed:\n" << infoLog << "\n";
+        return 0;
+    }
+
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    return program;
+}
+
+// Initialize pixelation FBOs
+static void InitPixelationFBOs() {
+    std::cout << "[OpenGL] Initializing pixelation FBOs...\n";
+
+    // Fullscreen quad for post-processing
+    float quadVertices[] = {
+        -1.0f,  1.0f,
+        -1.0f, -1.0f,
+         1.0f, -1.0f,
+        -1.0f,  1.0f,
+         1.0f, -1.0f,
+         1.0f,  1.0f
+    };
+
+    GLuint vbo;
+    glGenVertexArrays(1, &g_fullscreenVAO);
+    glGenBuffers(1, &vbo);
+    glBindVertexArray(g_fullscreenVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    glBindVertexArray(0);
+
+    // Offscreen FBO (full resolution)
+    glGenFramebuffers(1, &g_offscreenFBO);
+    glGenTextures(1, &g_offscreenTexture);
+    glGenRenderbuffers(1, &g_offscreenDepthRBO);
+
+    glBindTexture(GL_TEXTURE_2D, g_offscreenTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, g_screenWidth, g_screenHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glBindRenderbuffer(GL_RENDERBUFFER, g_offscreenDepthRBO);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, g_screenWidth, g_screenHeight);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, g_offscreenFBO);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_offscreenTexture, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g_offscreenDepthRBO);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        std::cerr << "[OpenGL] Offscreen framebuffer incomplete!\n";
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // Downsampled FBO (for pixelation)
+    glGenFramebuffers(1, &g_downsampledFBO);
+    glGenTextures(1, &g_downsampledTexture);
+
+    std::cout << "[OpenGL] Pixelation FBOs initialized\n";
+}
+
+// Load texture from GLTF
+static GLuint LoadTexture(const tinygltf::Image& image) {
+    GLuint textureID;
+    glGenTextures(1, &textureID);
+    glBindTexture(GL_TEXTURE_2D, textureID);
+
+    GLenum format = GL_RGBA;
+    if (image.component == 1) format = GL_RED;
+    else if (image.component == 2) format = GL_RG;
+    else if (image.component == 3) format = GL_RGB;
+    else if (image.component == 4) format = GL_RGBA;
+
+    glTexImage2D(GL_TEXTURE_2D, 0, format, image.width, image.height, 0, format, GL_UNSIGNED_BYTE, image.image.data());
+    glGenerateMipmap(GL_TEXTURE_2D);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    return textureID;
+}
+
+// Helper to extract matrix from GLTF node (C++ only, not exported)
+glm::mat4 GetNodeTransform(const tinygltf::Node& node) {
+    glm::mat4 transform(1.0f);
+
+    if (node.matrix.size() == 16) {
+        // Node has matrix directly
+        transform = glm::make_mat4(node.matrix.data());
+    } else {
+        // Build from TRS
+        if (node.translation.size() == 3) {
+            transform = glm::translate(transform, glm::vec3(node.translation[0], node.translation[1], node.translation[2]));
+        }
+        if (node.rotation.size() == 4) {
+            glm::quat q(node.rotation[3], node.rotation[0], node.rotation[1], node.rotation[2]);
+            transform *= glm::mat4_cast(q);
+        }
+        if (node.scale.size() == 3) {
+            transform = glm::scale(transform, glm::vec3(node.scale[0], node.scale[1], node.scale[2]));
+        }
+    }
+
+    return transform;
+}
+
+// Recursive function to traverse scene graph and load meshes with transformations
+void ProcessNode(const tinygltf::Model& model, int nodeIdx, const glm::mat4& parentTransform,
+                 const std::map<int, GLuint>& textureMap) {
+    const tinygltf::Node& node = model.nodes[nodeIdx];
+
+    // Get this node's transform and combine with parent
+    glm::mat4 localTransform = GetNodeTransform(node);
+    glm::mat4 globalTransform = parentTransform * localTransform;
+
+    // If this node has a mesh, process all its primitives
+    if (node.mesh >= 0) {
+        const tinygltf::Mesh& mesh = model.meshes[node.mesh];
+
+        for (size_t primIdx = 0; primIdx < mesh.primitives.size(); primIdx++) {
+            const auto& primitive = mesh.primitives[primIdx];
+            Mesh glMesh;
+            glMesh.baseColorFactor = glm::vec4(1.0f);
+            glMesh.baseColorTexture = 0;
+            glMesh.nodeTransform = globalTransform;
+
+            // Get material
+            if (primitive.material >= 0) {
+                const auto& material = model.materials[primitive.material];
+                auto bcfIt = material.values.find("baseColorFactor");
+                if (bcfIt != material.values.end()) {
+                    const auto& factor = bcfIt->second.ColorFactor();
+                    glMesh.baseColorFactor = glm::vec4(factor[0], factor[1], factor[2], factor[3]);
+                }
+
+                auto bctIt = material.values.find("baseColorTexture");
+                if (bctIt != material.values.end()) {
+                    int texIndex = bctIt->second.TextureIndex();
+                    if (texIndex >= 0) {
+                        int imageIndex = model.textures[texIndex].source;
+                        glMesh.baseColorTexture = textureMap.at(imageIndex);
+                    }
+                }
+            }
+
+            // Get vertex data
+            const tinygltf::Accessor& posAccessor = model.accessors[primitive.attributes.at("POSITION")];
+            const tinygltf::BufferView& posView = model.bufferViews[posAccessor.bufferView];
+            const tinygltf::Buffer& posBuffer = model.buffers[posView.buffer];
+            const float* positions = reinterpret_cast<const float*>(&posBuffer.data[posView.byteOffset + posAccessor.byteOffset]);
+
+            const float* normals = nullptr;
+            if (primitive.attributes.find("NORMAL") != primitive.attributes.end()) {
+                const tinygltf::Accessor& normAccessor = model.accessors[primitive.attributes.at("NORMAL")];
+                const tinygltf::BufferView& normView = model.bufferViews[normAccessor.bufferView];
+                const tinygltf::Buffer& normBuffer = model.buffers[normView.buffer];
+                normals = reinterpret_cast<const float*>(&normBuffer.data[normView.byteOffset + normAccessor.byteOffset]);
+            }
+
+            const float* texcoords = nullptr;
+            if (primitive.attributes.find("TEXCOORD_0") != primitive.attributes.end()) {
+                const tinygltf::Accessor& texAccessor = model.accessors[primitive.attributes.at("TEXCOORD_0")];
+                const tinygltf::BufferView& texView = model.bufferViews[texAccessor.bufferView];
+                const tinygltf::Buffer& texBuffer = model.buffers[texView.buffer];
+                texcoords = reinterpret_cast<const float*>(&texBuffer.data[texView.byteOffset + texAccessor.byteOffset]);
+            }
+
+            // Interleave vertex data
+            std::vector<float> vertices;
+            for (size_t v = 0; v < posAccessor.count; v++) {
+                vertices.push_back(positions[v * 3 + 0]);
+                vertices.push_back(positions[v * 3 + 1]);
+                vertices.push_back(positions[v * 3 + 2]);
+
+                if (normals) {
+                    vertices.push_back(normals[v * 3 + 0]);
+                    vertices.push_back(normals[v * 3 + 1]);
+                    vertices.push_back(normals[v * 3 + 2]);
+                } else {
+                    vertices.push_back(0.0f);
+                    vertices.push_back(1.0f);
+                    vertices.push_back(0.0f);
+                }
+
+                if (texcoords) {
+                    vertices.push_back(texcoords[v * 2 + 0]);
+                    vertices.push_back(texcoords[v * 2 + 1]);
+                } else {
+                    vertices.push_back(0.0f);
+                    vertices.push_back(0.0f);
+                }
+            }
+
+            // Get indices
+            const tinygltf::Accessor& indexAccessor = model.accessors[primitive.indices];
+            const tinygltf::BufferView& indexView = model.bufferViews[indexAccessor.bufferView];
+            const tinygltf::Buffer& indexBuffer = model.buffers[indexView.buffer];
+
+            std::vector<unsigned int> indices;
+            if (indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
+                const unsigned short* data = reinterpret_cast<const unsigned short*>(&indexBuffer.data[indexView.byteOffset + indexAccessor.byteOffset]);
+                for (size_t i = 0; i < indexAccessor.count; i++) {
+                    indices.push_back(data[i]);
+                }
+            } else if (indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
+                const unsigned int* data = reinterpret_cast<const unsigned int*>(&indexBuffer.data[indexView.byteOffset + indexAccessor.byteOffset]);
+                for (size_t i = 0; i < indexAccessor.count; i++) {
+                    indices.push_back(data[i]);
+                }
+            }
+
+            glMesh.indexCount = indices.size();
+
+            // Create OpenGL objects
+            glGenVertexArrays(1, &glMesh.vao);
+            glGenBuffers(1, &glMesh.vbo);
+            glGenBuffers(1, &glMesh.ebo);
+
+            glBindVertexArray(glMesh.vao);
+
+            glBindBuffer(GL_ARRAY_BUFFER, glMesh.vbo);
+            glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_STATIC_DRAW);
+
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, glMesh.ebo);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
+
+            // Position
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+
+            // Normal
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+
+            // TexCoord
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
+
+            glBindVertexArray(0);
+
+            g_meshes.push_back(glMesh);
+        }
+    }
+
+    // Process children recursively
+    for (int childIdx : node.children) {
+        ProcessNode(model, childIdx, globalTransform, textureMap);
+    }
+}
+
+// ========== Exported C functions ==========
+extern "C" {
+
+int InitRenderer() {
+    std::cout << "[OpenGL] InitRenderer called\n";
+
+    GLFWwindow* window = static_cast<GLFWwindow*>(windowPtr);
+    if (!window) {
+        std::cerr << "[OpenGL] No window!\n";
+        return -1;
+    }
+
+    glfwMakeContextCurrent(window);
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+        std::cerr << "[OpenGL] Failed to initialize GLAD\n";
+        return -1;
+    }
+
+    std::cout << "[OpenGL] Version: " << glGetString(GL_VERSION) << "\n";
+    std::cout << "[OpenGL] Renderer: " << glGetString(GL_RENDERER) << "\n";
+
+    glfwGetFramebufferSize(window, &g_screenWidth, &g_screenHeight);
+    glViewport(0, 0, g_screenWidth, g_screenHeight);
+
+    // Enable depth testing
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+
+    // Enable back-face culling
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glFrontFace(GL_CCW);
+
+    // Create shaders
+    g_mainShaderProgram = CreateShaderProgram(mainVertexShader, mainFragmentShader);
+    g_pixelShaderProgram = CreateShaderProgram(pixelVertexShader, pixelFragmentShader);
+
+    if (!g_mainShaderProgram || !g_pixelShaderProgram) {
+        std::cerr << "[OpenGL] Failed to create shaders\n";
+        return -1;
+    }
+
+    // Initialize pixelation system
+    InitPixelationFBOs();
+
+    // Register keyboard callback
+    glfwSetKeyCallback(window, KeyCallback);
+    std::cout << "[OpenGL] WASD camera controls enabled\n";
+
+    std::cout << "[OpenGL] Renderer initialized successfully\n";
+    return 0;
+}
+
+bool LoadGLTF(const char* path) {
+    std::cout << "[OpenGL] Loading GLTF: " << path << "\n";
+
+    tinygltf::TinyGLTF loader;
+    std::string err, warn;
+
+    // Try loading as ASCII first, then binary
+    bool ret = false;
+    std::string pathStr(path);
+    if (pathStr.find(".glb") != std::string::npos) {
+        std::cout << "[GLTF] Detected binary format (.glb)\n";
+        ret = loader.LoadBinaryFromFile(&g_model, &err, &warn, path);
+    } else {
+        std::cout << "[GLTF] Detected ASCII format (.gltf)\n";
+        ret = loader.LoadASCIIFromFile(&g_model, &err, &warn, path);
+    }
+
+    if (!warn.empty()) {
+        std::cout << "[GLTF] Warning: " << warn << "\n";
+    }
+    if (!err.empty()) {
+        std::cerr << "[GLTF] Error: " << err << "\n";
+        return false;
+    }
+    if (!ret) {
+        std::cerr << "[GLTF] Failed to parse file\n";
+        return false;
+    }
+
+    std::cout << "[GLTF] Model loaded: " << g_model.meshes.size() << " meshes, "
+              << g_model.materials.size() << " materials, "
+              << g_model.images.size() << " images\n";
+
+    // Load textures
+    std::map<int, GLuint> textureMap;
+    for (size_t i = 0; i < g_model.images.size(); i++) {
+        textureMap[i] = LoadTexture(g_model.images[i]);
+    }
+
+    // Clear any existing meshes
+    g_meshes.clear();
+
+    // Process the default scene or first scene
+    int sceneIdx = g_model.defaultScene >= 0 ? g_model.defaultScene : 0;
+    if (sceneIdx >= 0 && sceneIdx < g_model.scenes.size()) {
+        const tinygltf::Scene& scene = g_model.scenes[sceneIdx];
+        std::cout << "[GLTF] Processing scene " << sceneIdx << " with " << scene.nodes.size() << " root nodes\n";
+
+        // Process each root node in the scene
+        glm::mat4 identity(1.0f);
+        for (int nodeIdx : scene.nodes) {
+            ProcessNode(g_model, nodeIdx, identity, textureMap);
+        }
+    } else {
+        std::cerr << "[GLTF] No valid scene found!\n";
+        return false;
+    }
+
+    std::cout << "[OpenGL] Loaded " << g_meshes.size() << " total primitives from scene graph\n";
+
+    // Debug: Print bounding box info
+    if (!g_model.meshes.empty() && !g_model.meshes[0].primitives.empty()) {
+        auto& prim = g_model.meshes[0].primitives[0];
+        if (prim.attributes.find("POSITION") != prim.attributes.end()) {
+            const tinygltf::Accessor& posAccessor = g_model.accessors[prim.attributes.at("POSITION")];
+            std::cout << "[GLTF] Bounds: min=[" << posAccessor.minValues[0] << ", "
+                      << posAccessor.minValues[1] << ", " << posAccessor.minValues[2] << "], "
+                      << "max=[" << posAccessor.maxValues[0] << ", "
+                      << posAccessor.maxValues[1] << ", " << posAccessor.maxValues[2] << "]\n";
+        }
+    }
+
+    return true;
+}
+
+void SetModelTransform(float posX, float posY, float posZ,
+                       float scaleX, float scaleY, float scaleZ,
+                       float yaw, float pitch) {
+    g_modelPosition = glm::vec3(posX, posY, posZ);
+    g_modelScale = glm::vec3(scaleX, scaleY, scaleZ);
+    g_modelYaw = yaw;
+    g_modelPitch = pitch;
+}
+
+void SetCameraTransform(float camPosX, float camPosY, float camPosZ,
+                        float focusX, float focusY, float focusZ) {
+    g_cameraPosition = glm::vec3(camPosX, camPosY, camPosZ);
+    g_cameraTarget = glm::vec3(focusX, focusY, focusZ);
+}
+
+void SetPixelationAmount(float scale) {
+    scale = std::clamp(scale, 0.01f, 1.0f);
+    g_pixelScale = scale;
+    g_pixelationEnabled = true;
+
+    int downsampledWidth = (int)(g_screenWidth * scale);
+    int downsampledHeight = (int)(g_screenHeight * scale);
+
+    glBindTexture(GL_TEXTURE_2D, g_downsampledTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, downsampledWidth, downsampledHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, g_downsampledFBO);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_downsampledTexture, 0);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        std::cerr << "[OpenGL] Downsampled framebuffer incomplete!\n";
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    std::cout << "[OpenGL] Pixelation enabled: " << (scale * 100.0f) << "% (" << downsampledWidth << "x" << downsampledHeight << ")\n";
+}
+
+void DisablePixelation() {
+    g_pixelationEnabled = false;
+    g_pixelScale = 1.0f;
+    std::cout << "[OpenGL] Pixelation disabled\n";
+}
+
+void RenderFrame() {
+    static bool firstFrame = true;
+    if (firstFrame) {
+        std::cout << "[OpenGL] First frame - Camera at (" << g_cameraPosition.x << ", "
+                  << g_cameraPosition.y << ", " << g_cameraPosition.z << "), "
+                  << "looking at (" << g_cameraTarget.x << ", " << g_cameraTarget.y << ", "
+                  << g_cameraTarget.z << "), " << g_meshes.size() << " meshes to render\n";
+        firstFrame = false;
+    }
+
+    // Handle camera movement
+    glm::vec3 movement(0.0f);
+    if (g_keyW) movement.z -= g_cameraSpeed;
+    if (g_keyS) movement.z += g_cameraSpeed;
+    if (g_keyA) movement.x -= g_cameraSpeed;
+    if (g_keyD) movement.x += g_cameraSpeed;
+
+    if (glm::length(movement) > 0.0f) {
+        g_cameraPosition += movement;
+        g_cameraTarget += movement;
+    }
+
+    // Calculate matrices
+    glm::mat4 view = glm::lookAt(g_cameraPosition, g_cameraTarget, g_cameraUp);
+    glm::mat4 projection = glm::perspective(glm::radians(45.0f), (float)g_screenWidth / (float)g_screenHeight, 0.01f, 1000.0f);
+
+    // Global transform for the entire model (set via SetModelTransform)
+    glm::mat4 globalModelTransform = glm::translate(glm::mat4(1.0f), g_modelPosition);
+    globalModelTransform = glm::rotate(globalModelTransform, g_modelYaw, glm::vec3(0.0f, 1.0f, 0.0f));
+    globalModelTransform = glm::rotate(globalModelTransform, g_modelPitch, glm::vec3(1.0f, 0.0f, 0.0f));
+    globalModelTransform = glm::scale(globalModelTransform, g_modelScale);
+
+    // Render to offscreen FBO (or directly if pixelation disabled)
+    GLuint targetFBO = g_pixelationEnabled ? g_offscreenFBO : 0;
+    glBindFramebuffer(GL_FRAMEBUFFER, targetFBO);
+    glViewport(0, 0, g_screenWidth, g_screenHeight);
+
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // Render scene
+    glUseProgram(g_mainShaderProgram);
+
+    // Set view and projection (same for all meshes)
+    glUniformMatrix4fv(glGetUniformLocation(g_mainShaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
+    glUniformMatrix4fv(glGetUniformLocation(g_mainShaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
+
+    glm::vec3 lightPos(5.0f, 10.0f, 5.0f);
+    glUniform3fv(glGetUniformLocation(g_mainShaderProgram, "lightPos"), 1, glm::value_ptr(lightPos));
+    glUniform3fv(glGetUniformLocation(g_mainShaderProgram, "viewPos"), 1, glm::value_ptr(g_cameraPosition));
+
+    // Render each mesh with its own transformation from the scene graph
+    for (const auto& mesh : g_meshes) {
+        // Combine global model transform with this mesh's node transform from GLTF
+        glm::mat4 finalModelMatrix = globalModelTransform * mesh.nodeTransform;
+        glUniformMatrix4fv(glGetUniformLocation(g_mainShaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(finalModelMatrix));
+
+        glUniform4fv(glGetUniformLocation(g_mainShaderProgram, "baseColorFactor"), 1, glm::value_ptr(mesh.baseColorFactor));
+
+        bool hasTexture = mesh.baseColorTexture != 0;
+        glUniform1i(glGetUniformLocation(g_mainShaderProgram, "hasTexture"), hasTexture);
+
+        if (hasTexture) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, mesh.baseColorTexture);
+            glUniform1i(glGetUniformLocation(g_mainShaderProgram, "baseColorTexture"), 0);
+        }
+
+        glBindVertexArray(mesh.vao);
+        glDrawElements(GL_TRIANGLES, mesh.indexCount, GL_UNSIGNED_INT, 0);
+    }
+
+    glBindVertexArray(0);
+
+    // Apply pixelation if enabled
+    if (g_pixelationEnabled) {
+        int downsampledWidth = (int)(g_screenWidth * g_pixelScale);
+        int downsampledHeight = (int)(g_screenHeight * g_pixelScale);
+
+        // Downsample to small texture
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_offscreenFBO);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_downsampledFBO);
+        glBlitFramebuffer(0, 0, g_screenWidth, g_screenHeight,
+                         0, 0, downsampledWidth, downsampledHeight,
+                         GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+        // Upsample to screen with nearest-neighbor
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, g_screenWidth, g_screenHeight);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        glDisable(GL_DEPTH_TEST);
+        glUseProgram(g_pixelShaderProgram);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_downsampledTexture);
+        glUniform1i(glGetUniformLocation(g_pixelShaderProgram, "screenTexture"), 0);
+
+        glBindVertexArray(g_fullscreenVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glBindVertexArray(0);
+
+        glEnable(GL_DEPTH_TEST);
+    }
+
+    // Swap buffers
+    GLFWwindow* window = static_cast<GLFWwindow*>(windowPtr);
+    if (window) {
+        glfwSwapBuffers(window);
+    }
+}
+
+void CleanupRenderer() {
+    std::cout << "[OpenGL] Cleaning up...\n";
+
+    // Cleanup meshes
+    for (auto& mesh : g_meshes) {
+        glDeleteVertexArrays(1, &mesh.vao);
+        glDeleteBuffers(1, &mesh.vbo);
+        glDeleteBuffers(1, &mesh.ebo);
+        if (mesh.baseColorTexture) {
+            glDeleteTextures(1, &mesh.baseColorTexture);
+        }
+    }
+    g_meshes.clear();
+
+    // Cleanup shaders
+    if (g_mainShaderProgram) glDeleteProgram(g_mainShaderProgram);
+    if (g_pixelShaderProgram) glDeleteProgram(g_pixelShaderProgram);
+
+    // Cleanup FBOs
+    if (g_offscreenFBO) glDeleteFramebuffers(1, &g_offscreenFBO);
+    if (g_offscreenTexture) glDeleteTextures(1, &g_offscreenTexture);
+    if (g_offscreenDepthRBO) glDeleteRenderbuffers(1, &g_offscreenDepthRBO);
+    if (g_downsampledFBO) glDeleteFramebuffers(1, &g_downsampledFBO);
+    if (g_downsampledTexture) glDeleteTextures(1, &g_downsampledTexture);
+    if (g_fullscreenVAO) glDeleteVertexArrays(1, &g_fullscreenVAO);
+
+    std::cout << "[OpenGL] Cleanup complete\n";
+}
+
+} // extern "C"
